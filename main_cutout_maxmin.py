@@ -64,6 +64,7 @@ def parse_args():
     # run config
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--seed', type=int, default=17)
+    parser.add_argument('--ctx', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=7)
 
     # optim config
@@ -294,7 +295,7 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
 
 
 def main_cutout_maxmin():
-    torch.cuda.set_device(2)
+    torch.cuda.set_device(args.ctx)
     # parse command line arguments
     config = parse_args()
     logger.info(json.dumps(config, indent=2))
