@@ -23,7 +23,7 @@ try:
 except Exception:
     is_tensorboard_available = False
 
-from dataloader import get_loader
+from dataloader_cutout import get_loader
 
 torch.backends.cudnn.benchmark = True
 
@@ -54,6 +54,12 @@ def parse_args():
     parser.add_argument('--shake_forward', type=str2bool, default=True)
     parser.add_argument('--shake_backward', type=str2bool, default=True)
     parser.add_argument('--shake_image', type=str2bool, default=True)
+    
+    # cutout
+    parser.add_argument('--use_cutout', action='store_true', default=False)
+    parser.add_argument('--cutout_size', type=int, default=16)
+    parser.add_argument('--cutout_prob', type=float, default=1)
+    parser.add_argument('--cutout_inside', action='store_true', default=False)
 
     # run config
     parser.add_argument('--outdir', type=str, required=True)
@@ -100,6 +106,10 @@ def parse_args():
 
     data_config = OrderedDict([
         ('dataset', 'CIFAR10'),
+        ('use_cutout', args.use_cutout),
+        ('cutout_size', args.cutout_size),
+        ('cutout_prob', args.cutout_prob),
+        ('cutout_inside', args.cutout_inside),
     ])
 
     run_config = OrderedDict([
@@ -283,14 +293,15 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
     return accuracy
 
 
-def main_min():
-    torch.cuda.set_device(3)
+def main_cutout_maxmin():
+    torch.cuda.set_device(2)
     # parse command line arguments
     config = parse_args()
     logger.info(json.dumps(config, indent=2))
 
     run_config = config['run_config']
     optim_config = config['optim_config']
+    data_config = config['data_config']
 
     # TensorBoard SummaryWriter
     writer = SummaryWriter() if run_config['tensorboard'] else None
@@ -312,8 +323,8 @@ def main_min():
         json.dump(config, fout, indent=2)
 
     # data loaders
-    train_loader, test_loader = get_loader(optim_config['batch_size'],
-                                           run_config['num_workers'])
+    train_loader, test_loader = get_loader(
+        optim_config['batch_size'], run_config['num_workers'], data_config)
 
     # model
     model = load_model(config['model_config'])
@@ -358,4 +369,4 @@ def main_min():
 
 
 if __name__ == '__main__':
-    main_min()
+    main_cutout_maxmin()

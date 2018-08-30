@@ -16,6 +16,20 @@ def initialize_weights(module):
     elif isinstance(module, nn.Linear):
         module.bias.data.zero_()
 
+class NRelu(nn.Module):
+    """
+    -max(-x,0)
+    Parameters
+    ----------
+    Input shape: (N, C, W, H)
+    Output shape: (N, C * W * H)
+    """
+    def __init__(self, inplace):
+        super(NRelu, self).__init__()
+        self.inplace = inplace
+
+    def forward(self, x):
+        return -F.relu(-x, inplace=self.inplace)
 
 class ResidualPath(nn.Module):
     def __init__(self, in_channels, out_channels, stride):
@@ -44,7 +58,35 @@ class ResidualPath(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)), inplace=False)
         x = self.bn2(self.conv2(x))
         return x
+    
+class ResidualPathMin(nn.Module):
+    def __init__(self, in_channels, out_channels, stride):
+        super(ResidualPathMin, self).__init__()
 
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.nrelu = NRelu(inplace=False)
+
+    def forward(self, x):
+        x = self.nrelu(x)
+        x = self.nrelu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return x
 
 class DownsamplingShortcut(nn.Module):
     def __init__(self, in_channels):
@@ -78,7 +120,40 @@ class DownsamplingShortcut(nn.Module):
         z = self.bn(z)
 
         return z
+    
+class DownsamplingShortcutMin(nn.Module):
+    def __init__(self, in_channels):
+        super(DownsamplingShortcutMin, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False)
+        self.conv2 = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False)
+        self.bn = nn.BatchNorm2d(in_channels * 2)
+        self.nrelu = NRelu(inplace=False)
 
+    def forward(self, x):
+        x = self.nrelu(x)
+        y1 = F.avg_pool2d(x, kernel_size=1, stride=2, padding=0)
+        y1 = self.conv1(y1)
+
+        y2 = F.pad(x[:, :, 1:, 1:], (0, 1, 0, 1))
+        y2 = F.avg_pool2d(y2, kernel_size=1, stride=2, padding=0)
+        y2 = self.conv2(y2)
+
+        z = torch.cat([y1, y2], dim=1)
+        z = self.bn(z)
+
+        return z
 
 class BasicBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride, shake_config):
@@ -93,6 +168,34 @@ class BasicBlock(nn.Module):
         if in_channels != out_channels:
             self.shortcut.add_module('downsample',
                                      DownsamplingShortcut(in_channels))
+
+    def forward(self, x):
+        x1 = self.residual_path1(x)
+        x2 = self.residual_path2(x)
+
+        if self.training:
+            shake_config = self.shake_config
+        else:
+            shake_config = (False, False, False)
+
+        alpha, beta = get_alpha_beta(x.size(0), shake_config, x.is_cuda)
+        y = shake_function(x1, x2, alpha, beta)
+
+        return self.shortcut(x) + y
+    
+class BasicBlockMin(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, shake_config):
+        super(BasicBlockMin, self).__init__()
+
+        self.shake_config = shake_config
+
+        self.residual_path1 = ResidualPathMin(in_channels, out_channels, stride)
+        self.residual_path2 = ResidualPathMin(in_channels, out_channels, stride)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut.add_module('downsample',
+                                     DownsamplingShortcutMin(in_channels))
 
     def forward(self, x):
         x1 = self.residual_path1(x)
@@ -122,10 +225,13 @@ class Network(nn.Module):
                              config['shake_image'])
 
         block = BasicBlock
+        blockmin = BasicBlockMin
         n_blocks_per_stage = (depth - 2) // 6
         assert n_blocks_per_stage * 6 + 2 == depth
 
         n_channels = [base_channels, base_channels * 2, base_channels * 4]
+        
+        self.nrelu = NRelu(inplace=True)
 
         self.conv = nn.Conv2d(
             input_shape[1],
@@ -136,31 +242,40 @@ class Network(nn.Module):
             bias=False)
         self.bn = nn.BatchNorm2d(base_channels)
 
-        self.stage1 = self._make_stage(
-            n_channels[0], n_channels[0], n_blocks_per_stage, block, stride=1)
-        self.stage2 = self._make_stage(
-            n_channels[0], n_channels[1], n_blocks_per_stage, block, stride=2)
-        self.stage3 = self._make_stage(
-            n_channels[1], n_channels[2], n_blocks_per_stage, block, stride=2)
+        self.stage1, self.stagemin1 = self._make_stage(
+            n_channels[0], n_channels[0], n_blocks_per_stage, block, blockmin, stride=1)
+        self.stage2, self.stagemin2 = self._make_stage(
+            n_channels[0], n_channels[1], n_blocks_per_stage, block, blockmin, stride=2)
+        self.stage3, self.stagemin3 = self._make_stage(
+            n_channels[1], n_channels[2], n_blocks_per_stage, block, blockmin, stride=2)
 
         # compute conv feature size
         with torch.no_grad():
             self.feature_size = self._forward_conv(
-                torch.zeros(*input_shape)).view(-1).shape[0]
+                torch.zeros(*input_shape))[0].view(-1).shape[0]
 
         self.fc = nn.Linear(self.feature_size, n_classes)
 
         # initialize weights
         self.apply(initialize_weights)
 
-    def _make_stage(self, in_channels, out_channels, n_blocks, block, stride):
+    def _make_stage(self, in_channels, out_channels, n_blocks, block, blockmin, stride):
         stage = nn.Sequential()
+        stagemin = nn.Sequential()
         for index in range(n_blocks):
             block_name = 'block{}'.format(index + 1)
+            blockmin_name = 'blockmin{}'.format(index + 1)
             if index == 0:
                 stage.add_module(
                     block_name,
                     block(
+                        in_channels,
+                        out_channels,
+                        stride=stride,
+                        shake_config=self.shake_config))
+                stagemin.add_module(
+                    blockmin_name,
+                    blockmin(
                         in_channels,
                         out_channels,
                         stride=stride,
@@ -173,18 +288,33 @@ class Network(nn.Module):
                         out_channels,
                         stride=1,
                         shake_config=self.shake_config))
-        return stage
+                stagemin.add_module(
+                    blockmin_name,
+                    blockmin(
+                        out_channels,
+                        out_channels,
+                        stride=1,
+                        shake_config=self.shake_config))
+        return stage, stagemin
 
     def _forward_conv(self, x):
-        x = F.relu(self.bn(self.conv(x)), inplace=True)
+        x = self.bn(self.conv(x))
+        x = F.relu(x, inplace=True)
+        xmin = self.nrelu(x)
         x = self.stage1(x)
+        xmin = self.stagemin1(xmin)
         x = self.stage2(x)
+        xmin = self.stagemin2(xmin)
         x = self.stage3(x)
+        xmin = self.stagemin3(xmin)
         x = F.adaptive_avg_pool2d(x, output_size=1)
-        return x
+        xmin = F.adaptive_avg_pool2d(xmin, output_size=1)
+        return x, xmin
 
     def forward(self, x):
-        x = self._forward_conv(x)
+        x, xmin = self._forward_conv(x)
         x = x.view(x.size(0), -1)
+        xmin = xmin.view(xmin.size(0), -1)
         x = self.fc(x)
-        return x
+        xmin = self.fc(xmin)
+        return x, xmin

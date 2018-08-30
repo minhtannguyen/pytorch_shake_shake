@@ -283,8 +283,8 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
     return accuracy
 
 
-def main_min():
-    torch.cuda.set_device(3)
+def main():
+    torch.cuda.set_device(2)
     # parse command line arguments
     config = parse_args()
     logger.info(json.dumps(config, indent=2))
@@ -358,4 +358,4 @@ def main_min():
 
 
 if __name__ == '__main__':
-    main_min()
+    main()
