@@ -115,6 +115,7 @@ def parse_args():
 
     run_config = OrderedDict([
         ('seed', args.seed),
+        ('ctx', args.ctx),
         ('outdir', args.outdir),
         ('num_workers', args.num_workers),
         ('tensorboard', args.tensorboard),
@@ -251,6 +252,8 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
 
     loss_meter = AverageMeter()
     correct_meter = AverageMeter()
+    correctmax_meter = AverageMeter()
+    correctmin_meter = AverageMeter()
     start = time.time()
     for step, (data, targets) in enumerate(test_loader):
         if run_config['tensorboard'] and epoch == 0 and step == 0:
@@ -266,18 +269,26 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
         loss = 0.5*criterion(outputs, targets) + 0.5*criterion(outputsmin, targets)
 
         _, preds = torch.max(0.5*outputs + 0.5*outputsmin, dim=1)
+        _, predsmax = torch.max(outputs, dim=1)
+        _, predsmin = torch.max(outputsmin, dim=1)
 
         loss_ = loss.item()
         correct_ = preds.eq(targets).sum().item()
+        correctmax_ = predsmax.eq(targets).sum().item()
+        correctmin_ = predsmin.eq(targets).sum().item()
         num = data.size(0)
 
         loss_meter.update(loss_, num)
         correct_meter.update(correct_, 1)
+        correctmax_meter.update(correctmax_, 1)
+        correctmin_meter.update(correctmin_, 1)
 
     accuracy = correct_meter.sum / len(test_loader.dataset)
+    accuracymax = correctmax_meter.sum / len(test_loader.dataset)
+    accuracymin = correctmin_meter.sum / len(test_loader.dataset)
 
-    logger.info('Epoch {} Loss {:.4f} Accuracy {:.4f}'.format(
-        epoch, loss_meter.avg, accuracy))
+    logger.info('Epoch {} Loss {:.4f} Accuracy {:.4f} AccuracyMax {:.4f} AccuracyMin {:.4f}'.format(
+        epoch, loss_meter.avg, accuracy, accuracymax, accuracymin))
 
     elapsed = time.time() - start
     logger.info('Elapsed {:.2f}'.format(elapsed))
@@ -286,16 +297,17 @@ def test(epoch, model, criterion, test_loader, run_config, writer):
         if epoch > 0:
             writer.add_scalar('Test/Loss', loss_meter.avg, epoch)
         writer.add_scalar('Test/Accuracy', accuracy, epoch)
+        writer.add_scalar('Test/AccuracyMax', accuracymax, epoch)
+        writer.add_scalar('Test/AccuracyMin', accuracymin, epoch)
         writer.add_scalar('Test/Time', elapsed, epoch)
 
         for name, param in model.named_parameters():
             writer.add_histogram(name, param, global_step)
 
-    return accuracy
+    return accuracy, accuracymax, accuracymin
 
 
 def main_cutout_maxmin():
-    torch.cuda.set_device(args.ctx)
     # parse command line arguments
     config = parse_args()
     logger.info(json.dumps(config, indent=2))
@@ -308,6 +320,7 @@ def main_cutout_maxmin():
     writer = SummaryWriter() if run_config['tensorboard'] else None
 
     # set random seed
+    torch.cuda.set_device(run_config['ctx'])
     seed = run_config['seed']
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -346,12 +359,12 @@ def main_cutout_maxmin():
     scheduler = get_cosine_annealing_scheduler(optimizer, optim_config)
 
     # run test before start training
-    test(0, model, criterion, test_loader, run_config, writer)
+    _, _, _ =test(0, model, criterion, test_loader, run_config, writer)
 
     for epoch in range(1, optim_config['epochs'] + 1):
         train(epoch, model, optimizer, scheduler, criterion, train_loader,
               run_config, writer)
-        accuracy = test(epoch, model, criterion, test_loader, run_config,
+        accuracy, accuracymax, accuracymin = test(epoch, model, criterion, test_loader, run_config,
                         writer)
 
         state = OrderedDict([
@@ -361,12 +374,12 @@ def main_cutout_maxmin():
             ('epoch', epoch),
             ('accuracy', accuracy),
         ])
-        model_path = os.path.join(outdir, 'model_state.pth')
+        model_path = os.path.join(outdir, 'model_state_seed_%i.pth'%seed)
         torch.save(state, model_path)
 
-    if run_config['tensorboard']:
-        outpath = os.path.join(outdir, 'all_scalars.json')
-        writer.export_scalars_to_json(outpath)
+        if run_config['tensorboard']:
+            outpath = os.path.join(outdir, 'all_scalars.json')
+            writer.export_scalars_to_json(outpath)
 
 
 if __name__ == '__main__':
